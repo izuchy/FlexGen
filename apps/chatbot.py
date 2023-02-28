@@ -3,7 +3,7 @@ import argparse
 
 from transformers import AutoTokenizer
 from flexgen.flex_opt import (Policy, OptLM, TorchDevice, TorchDisk, TorchMixedDevice,
-    CompressionConfig, Env, Task, get_opt_config, str2bool)
+    CompressionConfig, ExecutionEnv, Task, get_opt_config, str2bool)
 
 
 def main(args):
@@ -11,7 +11,7 @@ def main(args):
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
-    env = Env(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
     # Offloading policy
     policy = Policy(1, 1,
@@ -69,7 +69,7 @@ def main(args):
         except ValueError:
             outputs += "\n"
             index = outputs.index("\n", len(context))
-        
+
         outputs = outputs[:index + 1]
         print(outputs[len(context):], end="")
         context = outputs
