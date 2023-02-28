@@ -20,7 +20,7 @@ from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexgen.timer import timers
-from flexgen.utils import (Task, Env, GB, T, ValueHolder,
+from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
@@ -42,6 +42,8 @@ class Policy:
     cache_cpu_percent: float
     act_gpu_percent: float
     act_cpu_percent: float
+
+    only_cpu: bool
 
     # Whether to overlap the I/O and compute
     overlap: bool
@@ -101,12 +103,8 @@ def init_weight_list(weight_specs, policy, env):
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
 
-        if len(shape) < 2:
-            pin_memory = True
-            compress = False
-        else:
-            pin_memory = policy.pin_weight
-            compress = policy.compress_weight
+        pin_memory = policy.pin_weight
+        compress = policy.compress_weight
 
         if not compress:
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
@@ -580,7 +578,13 @@ class TransformerLayer:
 
 
 class OptLM:
-    def __init__(self, config, env, path, policy):
+    def __init__(self,
+                 config: Union[str, OptConfig],
+                 env: ExecutionEnv,
+                 path: str,
+                 policy: Policy):
+        if isinstance(config, str):
+            config = get_opt_config(config)
         self.config = config
         self.env = env
         self.path = path
@@ -608,10 +612,11 @@ class OptLM:
         else:
             raise NotImplementedError()
 
-        # CUDA streams
-        self.load_weight_stream = torch.cuda.Stream()
-        self.load_cache_stream = torch.cuda.Stream()
-        self.store_cache_stream = torch.cuda.Stream()
+        if self.env.gpu.device_type == DeviceType.CUDA:
+            # CUDA streams
+            self.load_weight_stream = torch.cuda.Stream()
+            self.load_cache_stream = torch.cuda.Stream()
+            self.store_cache_stream = torch.cuda.Stream()
 
         # Intermediate tensors
         # The following buffers store values used
@@ -628,6 +633,7 @@ class OptLM:
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
+        self.init_all_weights()
 
     def set_task(self, task):
         self.task = task
@@ -762,7 +768,12 @@ class OptLM:
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
-            self.output_ids[left:right, pos:pos+1] = ids
+            if self.task.stop:
+                self.output_ids[left:right, pos:pos+1] = np.where(
+                    self.stopped, self.config.pad_token_id, ids)
+                self.stopped = np.logical_or(self.stopped, ids == self.task.stop)
+            else:
+                self.output_ids[left:right, pos:pos+1] = ids
         else:  # move to home
             x = self.hidden[i][j][k]
             if x.val:  # x may already be moved due to overlapping
@@ -779,7 +790,8 @@ class OptLM:
 
     def sync(self):
         self.env.disk.synchronize()
-        torch.cuda.synchronize()
+        if self.env.gpu.device_type == DeviceType.CUDA:
+            torch.cuda.synchronize()
 
     def init_all_weights(self):
         self.weight_home = array_1d(self.num_layers, ValueHolder)
@@ -835,7 +847,9 @@ class OptLM:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
 
         # Output token ids
-        self.output_ids = np.ones((len(task.inputs), prompt_len + gen_len), dtype=np.int32)
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
@@ -1013,7 +1027,7 @@ class OptLM:
                 self.sync()
             timers("generate").stop()
 
-            if self.output_ids[0, self.task.prompt_len + i] == self.task.stop:
+            if self.task.stop and np.all(self.stopped):
                 break
 
     def generation_loop_overlap_multi_batch(self):
@@ -1130,6 +1144,9 @@ class OptLM:
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
+    def __del__(self):
+        self.delete_all_weights()
+
 
 def get_filename(args):
     model_size = args.model.split('-')[-1]
@@ -1167,15 +1184,18 @@ def run_flexgen(args):
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
-    gpu = TorchDevice("cuda:0")
+    if args.platform == "cpu":
+        gpu = TorchDevice("cpu")
+    else:
+        gpu = TorchDevice(args.platform)
     cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = Env(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    disk = TorchDisk(args.offload_dir,platform=args.platform)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]), platform=args.platform)
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
                     args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
+                    args.percent[4], args.percent[5], args.platform == "cpu",
                     args.overlap, args.sep_layer, args.pin_weight,
                     args.cpu_cache_compute, args.attn_sparsity,
                     args.compress_weight,
@@ -1186,32 +1206,30 @@ def run_flexgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
-    model = OptLM(opt_config, env, args.path, policy)
+    # use float32 for CPU platform
+    opt_config = get_opt_config(args.model, dtype=np.float32 if args.platform == "cpu" else np.float16)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
+    print("init weight...")
+    model = OptLM(opt_config, env, args.path, policy)
+
     try:
-        print("warmup - init weights")
-        model.init_all_weights()
         print("warmup - generate")
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
-        # Benchmark
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
-        print("benchmark - delete weights")
-        model.delete_all_weights()
     finally:
-        disk.close_copy_threads()
+        env.close_copy_threads()
 
     # Log output
     prefill_latency = costs[0]
@@ -1297,6 +1315,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
 
+    parser.add_argument("--platform", type=str, default="cuda:0", help="use the number to specify device, the platform can also be cpu or mps")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1304,5 +1323,26 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert len(args.percent) == 6
+
+    if "cuda" in args.platform:
+        if not torch.cuda.is_available():
+            if torch.backends.mps.is_available():
+                args.platform = "mps:0"
+            else:
+                args.platform = "cpu"
+            print("CUDA devices not available, {} is used instead".format(args.platform))
+
+    if "mps" in args.platform:
+        if not torch.backends.mps.is_available():
+            args.platform = "cpu"
+            print("MPS devices not available, CPU is used instead")
+
+    if "cuda" not in args.platform:
+        # not clear how to enable overlap on MPS platform yet
+        args.overlap = False
+        args.pin_weight = False
+
+    if args.platform == "cpu":
+        args.percent = [0, 100, 0, 100, 0, 100]
 
     run_flexgen(args)

@@ -6,7 +6,9 @@ Some functions are adopted from https://github.com/alpa-projects/alpa/tree/main/
 
 import argparse
 import dataclasses
+import glob
 import os
+import shutil
 
 import numpy as np
 from tqdm import tqdm
@@ -52,6 +54,8 @@ def get_opt_config(name, **kwargs):
         name = name.split("/")[1]
     name = name.lower()
 
+    dtype = kwargs["dtype"] if "dtype" in kwargs else OptConfig.dtype
+
     # Handle opt-iml-30b and opt-iml-max-30b
     if "-iml-max" in name:
         arch_name = name.replace("-iml-max", "")
@@ -63,54 +67,54 @@ def get_opt_config(name, **kwargs):
     if arch_name == "opt-125m":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=12, n_head=12,
-            hidden_size=768, input_dim=768, ffn_embed_dim=768 * 4,
+            hidden_size=768, input_dim=768, ffn_embed_dim=768 * 4, dtype=dtype
         )
     elif arch_name == "opt-350m":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=24, n_head=16,
-            hidden_size=1024, input_dim=1024, ffn_embed_dim=1024 * 4,
+            hidden_size=1024, input_dim=1024, ffn_embed_dim=1024 * 4, dtype=dtype
         )
         raise NotImplementedError("Not implemented because this model "
                                   "has a different architecture")
     elif arch_name == "opt-1.3b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=24, n_head=32,
-            hidden_size=2048, input_dim=2048, ffn_embed_dim=2048 * 4,
+            hidden_size=2048, input_dim=2048, ffn_embed_dim=2048 * 4, dtype=dtype
         )
     elif arch_name == "opt-2.7b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=32, n_head=32,
-            hidden_size=2560, input_dim=2560, ffn_embed_dim=2560 * 4,
+            hidden_size=2560, input_dim=2560, ffn_embed_dim=2560 * 4, dtype=dtype
         )
     elif arch_name == "opt-6.7b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=32, n_head=32,
-            hidden_size=4096, input_dim=4096, ffn_embed_dim=4096 * 4,
+            hidden_size=4096, input_dim=4096, ffn_embed_dim=4096 * 4, dtype=dtype
         )
     elif arch_name == "opt-13b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=40, n_head=40,
-            hidden_size=5120, input_dim=5120, ffn_embed_dim=5120 * 4,
+            hidden_size=5120, input_dim=5120, ffn_embed_dim=5120 * 4, dtype=dtype
         )
     elif arch_name == "opt-30b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=48, n_head=56,
-            hidden_size=7168, input_dim=7168, ffn_embed_dim=7168 * 4,
+            hidden_size=7168, input_dim=7168, ffn_embed_dim=7168 * 4, dtype=dtype
         )
     elif arch_name == "opt-66b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=64, n_head=72,
-            hidden_size=9216, input_dim=9216, ffn_embed_dim=9216 * 4,
+            hidden_size=9216, input_dim=9216, ffn_embed_dim=9216 * 4, dtype=dtype
         )
     elif arch_name == "opt-175b":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=96, n_head=96,
-            hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4,
+            hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4, dtype=dtype
         )
     elif arch_name == "opt-175b-stage":
         config = OptConfig(name=name,
             max_seq_len=2048, num_hidden_layers=24, n_head=96,
-            hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4,
+            hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4, dtype=dtype
         )
     else:
         raise ValueError(f"Invalid model name: {name}")
@@ -118,7 +122,7 @@ def get_opt_config(name, **kwargs):
     return dataclasses.replace(config, **kwargs)
 
 
-def download_opt_weights(model_name, path):
+def download_opt_weights_old(model_name, path):
     """Download weights from huggingface."""
     import torch
     from transformers import OPTForCausalLM, BloomForCausalLM
@@ -199,6 +203,42 @@ def disable_hf_opt_init():
 
     setattr(transformers.models.opt.modeling_opt.OPTPreTrainedModel,
             "_init_weights", lambda *args, **kwargs: None)
+
+
+def download_opt_weights(model_name, path):
+    from huggingface_hub import snapshot_download
+    import torch
+
+    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
+          f"The downloading and cpu loading can take dozens of minutes. "
+          f"If it seems to get stuck, you can monitor the progress by "
+          f"checking the memory usage of this process.")
+
+    if "opt" in model_name:
+        hf_model_name = "facebook/" + model_name
+
+    folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    bin_files = glob.glob(os.path.join(folder, "*.bin"))
+
+    if "/" in model_name:
+        model_name = model_name.split("/")[1].lower()
+    path = os.path.join(path, f"{model_name}-np")
+    path = os.path.abspath(os.path.expanduser(path))
+    os.makedirs(path, exist_ok=True)
+
+    for bin_file in tqdm(bin_files, desc="Convert format"):
+        state = torch.load(bin_file)
+        for name, param in tqdm(state.items(), leave=False):
+            name = name.replace("model.", "")
+            name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
+            param_path = os.path.join(path, name)
+            with open(param_path, "wb") as f:
+                np.save(f, param.cpu().detach().numpy())
+
+            # shared embedding
+            if "decoder.embed_tokens.weight" in name:
+                shutil.copy(param_path, param_path.replace(
+                    "decoder.embed_tokens.weight", "lm_head.weight"))
 
 
 if __name__ == "__main__":
